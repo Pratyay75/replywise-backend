@@ -17,12 +17,17 @@ import httpx
 load_dotenv()
 
 app = FastAPI()
+
+# CORS configuration for Chrome extensions and web access
+# Note: allow_origins=["*"] cannot be used with allow_credentials=True
+# For Chrome extensions, we allow all origins but set credentials to False
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # allow Chrome extension
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],  # Allow all origins (including Chrome extensions)
+    allow_credentials=False,  # Must be False when using allow_origins=["*"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # ---------- Azure OpenAI Client ----------
@@ -272,6 +277,11 @@ async def login(request: LoginRequest):
         "token_type": "bearer",
         "email": request.email
     }
+
+# Add explicit OPTIONS handler for CORS preflight requests
+@app.options("/{full_path:path}")
+async def options_handler(full_path: str):
+    return {"message": "OK"}
 
 @app.get("/auth/verify")
 async def verify_token(current_user: dict = Depends(get_current_user)):
