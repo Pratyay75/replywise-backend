@@ -13,6 +13,7 @@ from jose import JWTError, jwt
 from datetime import datetime, timedelta
 from typing import Optional
 import httpx
+import json
 
 load_dotenv()
 
@@ -693,7 +694,7 @@ Output ONLY the improved reply text with proper email formatting."""
         users_collection.update_one(
             {"email": current_user["email"]},
             {"$inc": {"regenerations_used_this_month": 1}}
-        )
+    )
 
     return {
         "draft": response.choices[0].message.content.strip()
@@ -706,43 +707,115 @@ class DraftInput(BaseModel):
 
 @app.post("/inbox-classify-lite")
 def inbox_classify_lite(email: InboxLiteInput):
-    prompt = f"""
-You are classifying Gmail inbox emails for visual highlighting.
+    prompt = f"""Classify this email into one of three categories: Important, Personal, or Ads.
 
-Decide the CATEGORY and IMPORTANCE.
+RULES:
+1. **Important**: 
+   - Work emails from colleagues, clients, or business contacts
+   - Emails with action items, deadlines, or requests
+   - Professional communications (even from companies like Google, Microsoft, etc. if they're about account security, important updates)
+   - Emails from real people asking for something or requiring a response
+   - Examples: "Meeting tomorrow", "Please review", "Your account was accessed", "Invoice attached"
 
-CATEGORIES:
-- Important → Work-related, requests, deadlines, real people
-- Personal → Friends, family, casual conversations
-- Ads → Promotions, newsletters, marketing, automated emails
+2. **Personal**: 
+   - Emails from friends, family, or personal contacts
+   - Casual conversations and personal updates
+   - Social invitations or personal messages
+   - Examples: "Hey, how are you?", "Birthday party", "Catch up soon"
 
-IMPORTANCE:
-- High → Needs attention
-- Low → Can be ignored for now
+3. **Ads**: 
+   - Marketing emails, promotions, sales
+   - Newsletters and automated updates
+   - Spam or promotional content
+   - No action required, just informational
+   - Examples: "50% off sale", "Weekly newsletter", "New product launch", "Special offer"
 
-EMAIL:
+EMAIL TO CLASSIFY:
 From: {email.sender}
 Subject: {email.subject}
 
-Respond ONLY in valid JSON:
-{{
-  "category": "Important | Personal | Ads",
-  "importance": "High | Low"
-}}
-"""
+Analyze the sender and subject carefully. If the sender is a company but the subject suggests it's an important account-related email (security, billing, important updates), classify as "Important". If it's clearly promotional or marketing, classify as "Ads".
 
+Respond with ONLY valid JSON, no other text:
+{{
+  "category": "Important",
+  "importance": "High"
+}}
+
+Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for importance."""
+
+    try:
+        # Try with response_format first (if supported), otherwise fallback
+        try:
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,  # Lower temperature for more consistent classification
+                max_tokens=100,
+                response_format={"type": "json_object"}  # Force JSON response if supported
+            )
+        except Exception as format_error:
+            # Fallback if response_format is not supported
+            print(f"response_format not supported, using fallback: {format_error}")
     response = client.chat.completions.create(
         model=DEPLOYMENT_NAME,
         messages=[
-            {"role": "system", "content": "You classify emails for inbox highlighting."},
+                    {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only, no markdown, no code blocks, just the JSON object."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0,
-        max_tokens=80
-    )
+                temperature=0.1,
+                max_tokens=100
+            )
 
+        result_text = response.choices[0].message.content.strip()
+        
+        # Remove markdown code blocks if present
+        if result_text.startswith("```json"):
+            result_text = result_text[7:]
+        if result_text.startswith("```"):
+            result_text = result_text[3:]
+        if result_text.endswith("```"):
+            result_text = result_text[:-3]
+        result_text = result_text.strip()
+        
+        # Parse to validate JSON
+        import json
+        parsed = json.loads(result_text)
+        
+        # Validate category
+        category = parsed.get("category", "Ads")
+        if category not in ["Important", "Personal", "Ads"]:
+            # Try to normalize
+            category_lower = category.lower()
+            if "important" in category_lower or "work" in category_lower:
+                category = "Important"
+            elif "personal" in category_lower or "friend" in category_lower or "family" in category_lower:
+                category = "Personal"
+            else:
+                category = "Ads"
+        
+        # Validate importance
+        importance = parsed.get("importance", "Low")
+        if importance not in ["High", "Low"]:
+            importance = "Low"
+        
+        return {
+            "result": json.dumps({
+                "category": category,
+                "importance": importance
+            })
+        }
+    except Exception as e:
+        # Fallback on error
+        print(f"Classification error: {e}")
     return {
-        "result": response.choices[0].message.content
+            "result": json.dumps({
+                "category": "Ads",
+                "importance": "Low"
+            })
     }
 
 
@@ -769,7 +842,7 @@ def save_draft(data: DraftInput):
         body=draft
     ).execute()
 
-    return {"status": "draft saved"} 
+    return {"status": "draft saved"}
 '''
 
 # ---------- Run directly ----------
