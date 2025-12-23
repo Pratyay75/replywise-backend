@@ -1,0 +1,24 @@
+# Backend framework
+fastapi
+uvicorn
+python-dotenv
+
+# OpenAI (Azure OpenAI)
+openai
+
+# Google Gmail API (DRAFT ONLY)
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+google-api-python-client
+
+# Authentication & Database
+pymongo
+bcrypt
+python-jose[cryptography]
+passlib[bcrypt]
+email-validator
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+httpx

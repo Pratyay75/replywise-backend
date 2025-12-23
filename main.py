@@ -1,0 +1,745 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, EmailStr
+from dotenv import load_dotenv
+import os
+from openai import AzureOpenAI
+import uvicorn
+from fastapi.middleware.cors import CORSMiddleware
+from pymongo import MongoClient
+from pymongo.errors import DuplicateKeyError
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
+from typing import Optional
+import httpx
+
+load_dotenv()
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # allow Chrome extension
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Azure OpenAI Client ----------
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+DEPLOYMENT_NAME = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+if not all([AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_ENDPOINT, DEPLOYMENT_NAME]):
+    raise ValueError("All Azure OpenAI environment variables are required: AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_DEPLOYMENT")
+
+client = AzureOpenAI(
+    api_key=AZURE_OPENAI_API_KEY,
+    api_version=AZURE_OPENAI_API_VERSION,
+    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+)
+
+# ---------- MongoDB Connection ----------
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is required")
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["replywise"]
+users_collection = db["users"]
+
+# Create unique index on email
+users_collection.create_index("email", unique=True)
+
+# ---------- Admin Configuration ----------
+ADMIN_ID = os.getenv("ADMIN_ID", "admin.quickreply@gmail.com").lower()
+ADMIN_PWD = os.getenv("ADMIN_PWD") or os.getenv("ADMI_PWD")  # Support both spellings
+if not ADMIN_PWD:
+    raise ValueError("ADMIN_PWD environment variable is required")
+
+# ---------- Authentication Setup ----------
+# SECRET_KEY is used to sign JWT tokens - should be a long random string
+# For production, generate a secure random key (e.g., using: python -c "import secrets; print(secrets.token_urlsafe(32))")
+SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production-use-secrets-token-urlsafe-32")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60  # 30 days
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        token = credentials.credentials
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email: str = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    
+    user = users_collection.find_one({"email": email})
+    if user is None:
+        raise credentials_exception
+    return user
+
+# ---------- Models ----------
+class EmailInput(BaseModel):
+    subject: str
+    sender: str
+    body: str
+    tone: str | None = "Professional & Polite"
+    length: str | None = "Balanced reply"
+
+
+class InboxLiteInput(BaseModel):
+    sender: str
+    subject: str
+
+class RegenerateInput(BaseModel):
+    subject: str
+    original_body: str
+    previous_draft: str
+    options: list[str]
+    instruction: str | None = ""
+    tone: str | None = "Professional & Polite"
+    length: str | None = "Balanced reply"
+
+class SignupRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str
+    email: str
+
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+# ---------- Authentication Endpoints ----------
+@app.post("/auth/signup", response_model=TokenResponse)
+async def signup(request: SignupRequest):
+    # Check if user already exists
+    existing_user = users_collection.find_one({"email": request.email})
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Check if this is the admin account
+    is_admin = request.email.lower() == ADMIN_ID
+    
+    # Hash password and create user
+    hashed_password = get_password_hash(request.password)
+    user = {
+        "email": request.email,
+        "hashed_password": hashed_password,
+        "plan": "admin" if is_admin else "free",  # Admin or free plan
+        "replies_used_this_month": 0,
+        "regenerations_used_this_month": 0,
+        "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+        "learn_writing_style": False,
+        "writing_samples": [],
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    
+    try:
+        users_collection.insert_one(user)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Email already registered"
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": request.email}, expires_delta=access_token_expires
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "email": request.email
+    }
+
+@app.post("/auth/login", response_model=TokenResponse)
+async def login(request: LoginRequest):
+    # Check if this is the admin account
+    is_admin = request.email.lower() == ADMIN_ID
+    
+    # Find user
+    user = users_collection.find_one({"email": request.email})
+    
+    # If admin account doesn't exist, create it with password from env
+    if is_admin and not user:
+        hashed_password = get_password_hash(ADMIN_PWD)
+        user = {
+            "email": request.email,
+            "hashed_password": hashed_password,
+            "plan": "admin",
+            "replies_used_this_month": 0,
+            "regenerations_used_this_month": 0,
+            "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+            "learn_writing_style": False,
+            "writing_samples": [],
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow()
+        }
+        users_collection.insert_one(user)
+    elif not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password"
+        )
+    
+    # Verify password (for admin, check against stored password or env password)
+    if is_admin:
+        # For admin, verify against stored password or env password
+        if not verify_password(request.password, user["hashed_password"]):
+            # If password doesn't match stored, check against env password
+            if request.password != ADMIN_PWD:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Incorrect email or password"
+                )
+            # If env password matches, update stored password
+            else:
+                hashed_password = get_password_hash(ADMIN_PWD)
+                users_collection.update_one(
+                    {"email": request.email},
+                    {"$set": {"hashed_password": hashed_password}}
+                )
+    else:
+        # For regular users, verify stored password
+        if not verify_password(request.password, user["hashed_password"]):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password"
+            )
+    
+    # Update admin status if logging in as admin
+    if is_admin:
+        users_collection.update_one(
+            {"email": request.email},
+            {"$set": {
+                "plan": "admin",
+                "updated_at": datetime.utcnow()
+            }}
+        )
+    
+    # Create access token
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": request.email}, expires_delta=access_token_expires
+    )
+    
+    # Update last login
+    users_collection.update_one(
+        {"email": request.email},
+        {"$set": {"updated_at": datetime.utcnow()}}
+    )
+    
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "email": request.email
+    }
+
+@app.get("/auth/verify")
+async def verify_token(current_user: dict = Depends(get_current_user)):
+    return {
+        "email": current_user["email"],
+        "authenticated": True
+    }
+
+@app.post("/auth/google", response_model=TokenResponse)
+async def google_auth(request: GoogleAuthRequest):
+    try:
+        # For Chrome extensions, we get the access token and fetch user info
+        # The token from Chrome identity API is an OAuth2 access token
+        async with httpx.AsyncClient() as client:
+            user_info_response = await client.get(
+                "https://www.googleapis.com/oauth2/v2/userinfo",
+                headers={"Authorization": f"Bearer {request.id_token}"}
+            )
+            
+            if user_info_response.status_code != 200:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail="Failed to verify Google token"
+                )
+            
+            user_data = user_info_response.json()
+            email = user_data.get("email")
+            
+            if not email:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email not found in Google account"
+                )
+        
+        # Check if user exists
+        user = users_collection.find_one({"email": email})
+        
+        if not user:
+            # Create new user with Google auth
+            user = {
+                "email": email,
+                "auth_provider": "google",
+                "google_id": user_data.get("id"),
+                "name": user_data.get("name"),
+                "picture": user_data.get("picture"),
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            users_collection.insert_one(user)
+        else:
+            # Update last login and Google info
+            users_collection.update_one(
+                {"email": email},
+                {"$set": {
+                    "updated_at": datetime.utcnow(),
+                    "google_id": user_data.get("id"),
+                    "name": user_data.get("name"),
+                    "picture": user_data.get("picture"),
+                    "auth_provider": "google"
+                }}
+            )
+        
+        # Create access token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": email}, expires_delta=access_token_expires
+        )
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "email": email
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Google authentication failed: {str(e)}"
+        )
+
+# ---------- Health ----------
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+# ---------- User Management Endpoints ----------
+@app.get("/user/info")
+async def get_user_info(current_user: dict = Depends(get_current_user)):
+    user = users_collection.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if monthly limit needs reset
+    reset_date = datetime.fromisoformat(user.get("monthly_reset_date", (datetime.utcnow() + timedelta(days=30)).isoformat()))
+    if datetime.utcnow() > reset_date:
+        users_collection.update_one(
+            {"email": current_user["email"]},
+            {"$set": {
+                "replies_used_this_month": 0,
+                "regenerations_used_this_month": 0,
+                "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat()
+            }}
+        )
+        user["replies_used_this_month"] = 0
+        user["regenerations_used_this_month"] = 0
+    
+    return {
+        "email": user["email"],
+        "plan": user.get("plan", "free"),
+        "replies_used_this_month": user.get("replies_used_this_month", 0),
+        "regenerations_used_this_month": user.get("regenerations_used_this_month", 0),
+        "monthly_reset_date": user.get("monthly_reset_date"),
+        "learn_writing_style": user.get("learn_writing_style", False),
+        "writing_samples_count": len(user.get("writing_samples", []))
+    }
+
+class LearnStyleRequest(BaseModel):
+    enabled: bool
+
+@app.put("/user/learn-style")
+async def update_learn_style(request: LearnStyleRequest, current_user: dict = Depends(get_current_user)):
+    user = users_collection.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_plan = user.get("plan", "free")
+    if user_plan != "pro" and user_plan != "admin":
+        raise HTTPException(status_code=403, detail="This feature is only available for Pro users")
+    
+    users_collection.update_one(
+        {"email": current_user["email"]},
+        {"$set": {"learn_writing_style": request.enabled}}
+    )
+    
+    return {"success": True, "learn_writing_style": request.enabled}
+
+@app.post("/user/reset-style")
+async def reset_writing_style(current_user: dict = Depends(get_current_user)):
+    user = users_collection.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_plan = user.get("plan", "free")
+    if user_plan != "pro" and user_plan != "admin":
+        raise HTTPException(status_code=403, detail="This feature is only available for Pro users")
+    
+    users_collection.update_one(
+        {"email": current_user["email"]},
+        {"$set": {"writing_samples": []}}
+    )
+    
+    return {"success": True}
+
+# ---------- Core Intelligence ----------
+@app.post("/analyze-email")
+def analyze_email(email: EmailInput, current_user: dict = Depends(get_current_user)):
+    # Check reply limit for free users
+    user = users_collection.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Check if monthly limit needs reset
+    reset_date = datetime.fromisoformat(user.get("monthly_reset_date", (datetime.utcnow() + timedelta(days=30)).isoformat()))
+    if datetime.utcnow() > reset_date:
+        users_collection.update_one(
+            {"email": current_user["email"]},
+            {"$set": {
+                "replies_used_this_month": 0,
+                "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat()
+            }}
+        )
+        user["replies_used_this_month"] = 0
+    
+    # Check limit for free users
+    if user.get("plan", "free") == "free":
+        if user.get("replies_used_this_month", 0) >= 25:
+            raise HTTPException(
+                status_code=403,
+                detail="Monthly reply limit reached. Upgrade to Pro for unlimited replies."
+            )
+    
+    # Build tone instructions
+    tone_instructions = {
+        "Professional & Polite": "Use a professional, courteous, and respectful tone. Be formal but warm.",
+        "Warm & Friendly": "Use a warm, friendly, and approachable tone. Be conversational and personable.",
+        "Clear & Direct": "Use a clear, direct, and straightforward tone. Be concise and to the point.",
+        "Empathetic": "Use an empathetic, understanding, and compassionate tone. Show care and concern.",
+        "Apology": "Use a sincere, apologetic tone. Express genuine regret and offer solutions.",
+        "Assertive": "Use a confident, assertive, and decisive tone. Be firm but respectful.",
+        "Sales-friendly": "Use a persuasive, enthusiastic, and engaging tone. Highlight benefits and value.",
+        "Support / HR": "Use a helpful, supportive, and professional tone. Be clear and solution-oriented."
+    }
+    
+    tone_instruction = tone_instructions.get(email.tone or "Professional & Polite", tone_instructions["Professional & Polite"])
+    
+    # Build length instructions
+    length_instructions = {
+        "Quick reply (1–2 lines)": "Keep the reply very brief - 1 to 2 lines maximum. Be concise and direct.",
+        "Balanced reply": "Write a balanced reply - 2 to 4 sentences addressing the key points.",
+        "Detailed explanation": "Write a detailed reply - 4 to 6 sentences with thorough explanation and context."
+    }
+    
+    length_instruction = length_instructions.get(email.length or "Balanced reply", length_instructions["Balanced reply"])
+    
+    prompt = f"""Classify and draft a professional email reply.
+
+Classify: Work/Personal/Promotional/Spam
+Importance: High/Medium/Low
+
+TONE: {tone_instruction}
+LENGTH: {length_instruction}
+
+Write a well-structured, professional email reply. Format it properly as an email, not a casual message.
+
+REQUIRED STRUCTURE:
+1. Greeting (Hi/Hello/Dear [Name] or appropriate greeting based on context)
+2. Opening line acknowledging their email
+3. Main body ({length_instruction})
+4. Closing line if needed
+5. ALWAYS end with "Regards," on a new line
+
+FORMATTING RULES:
+- Use proper email structure with line breaks
+- Start with appropriate greeting
+- Tone: {tone_instruction}
+- No AI-sounding phrases
+- Always include "Regards," at the end
+- Make it look like a proper email, not a WhatsApp message
+
+Email:
+Subject: {email.subject}
+From: {email.sender}
+Body: {email.body[:1500]}
+
+JSON only:
+{{
+  "category": "",
+  "importance": "",
+  "draft": ""
+}}
+"""
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You are an expert at writing professional, well-structured email replies. Always format emails properly with greeting, body, and 'Regards' closing. Never write casual messages like WhatsApp."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3,
+        max_tokens=350  # Increased for proper structure
+    )
+    
+    # Increment reply count
+    users_collection.update_one(
+        {"email": current_user["email"]},
+        {"$inc": {"replies_used_this_month": 1}}
+    )
+
+    return {
+        "result": response.choices[0].message.content
+    }
+
+@app.post("/regenerate-reply")
+def regenerate_reply(data: RegenerateInput, current_user: dict = Depends(get_current_user)):
+    # Load user and enforce regenerate limits
+    user = users_collection.find_one({"email": current_user["email"]})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Reset monthly counters if needed
+    reset_date = datetime.fromisoformat(user.get("monthly_reset_date", (datetime.utcnow() + timedelta(days=30)).isoformat()))
+    if datetime.utcnow() > reset_date:
+        users_collection.update_one(
+            {"email": current_user["email"]},
+            {"$set": {
+                "replies_used_this_month": 0,
+                "regenerations_used_this_month": 0,
+                "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat()
+            }}
+        )
+        user["replies_used_this_month"] = 0
+        user["regenerations_used_this_month"] = 0
+
+    # Note: Per-reply regeneration limits are handled on the frontend
+    # Backend only tracks monthly limits for analytics, but doesn't block per-reply regenerations
+    user_plan = user.get("plan", "free")
+    # Build tone instructions
+    tone_instructions = {
+        "Professional & Polite": "Use a professional, courteous, and respectful tone. Be formal but warm.",
+        "Warm & Friendly": "Use a warm, friendly, and approachable tone. Be conversational and personable.",
+        "Clear & Direct": "Use a clear, direct, and straightforward tone. Be concise and to the point.",
+        "Empathetic": "Use an empathetic, understanding, and compassionate tone. Show care and concern.",
+        "Apology": "Use a sincere, apologetic tone. Express genuine regret and offer solutions.",
+        "Assertive": "Use a confident, assertive, and decisive tone. Be firm but respectful.",
+        "Sales-friendly": "Use a persuasive, enthusiastic, and engaging tone. Highlight benefits and value.",
+        "Support / HR": "Use a helpful, supportive, and professional tone. Be clear and solution-oriented."
+    }
+    
+    tone_instruction = tone_instructions.get(data.tone or "Professional & Polite", tone_instructions["Professional & Polite"])
+    
+    # Build length instructions
+    length_instructions = {
+        "Quick reply (1–2 lines)": "Keep the reply very brief - 1 to 2 lines maximum. Be concise and direct.",
+        "Balanced reply": "Write a balanced reply - 2 to 4 sentences addressing the key points.",
+        "Detailed explanation": "Write a detailed reply - 4 to 6 sentences with thorough explanation and context."
+    }
+    
+    length_instruction = length_instructions.get(data.length or "Balanced reply", length_instructions["Balanced reply"])
+    
+    options_text = ""
+    if data.options:
+        options_text = "Make it: " + ", ".join(data.options)
+
+    instruction_text = ""
+    if data.instruction:
+        instruction_text = f"\nAlso: {data.instruction}"
+
+    prompt = f"""Improve this email reply draft while maintaining proper email structure.
+
+Subject: {data.subject}
+Original email: {data.original_body[:800]}
+Current draft: {data.previous_draft}
+{options_text}{instruction_text}
+
+TONE: {tone_instruction}
+LENGTH: {length_instruction}
+
+REQUIREMENTS:
+- Maintain proper email structure (greeting, body, closing)
+- ALWAYS end with "Regards," on a new line
+- Tone: {tone_instruction}
+- Length: {length_instruction}
+- Address the modifications requested
+- Make it well-structured, not casual
+- Use proper line breaks and formatting
+
+Output ONLY the improved reply text with proper email formatting."""
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You improve email replies while maintaining professional email structure. Always include 'Regards' at the end. Format as a proper email, not a casual message."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.4,
+        max_tokens=350  # Increased for proper structure
+    )
+
+    # Increment regenerate count if free user
+    if user_plan == "free":
+        users_collection.update_one(
+            {"email": current_user["email"]},
+            {"$inc": {"regenerations_used_this_month": 1}}
+        )
+
+    return {
+        "draft": response.choices[0].message.content.strip()
+    }
+
+
+class DraftInput(BaseModel):
+    subject: str
+    body: str
+
+@app.post("/inbox-classify-lite")
+def inbox_classify_lite(email: InboxLiteInput):
+    prompt = f"""
+You are classifying Gmail inbox emails for visual highlighting.
+
+Decide the CATEGORY and IMPORTANCE.
+
+CATEGORIES:
+- Important → Work-related, requests, deadlines, real people
+- Personal → Friends, family, casual conversations
+- Ads → Promotions, newsletters, marketing, automated emails
+
+IMPORTANCE:
+- High → Needs attention
+- Low → Can be ignored for now
+
+EMAIL:
+From: {email.sender}
+Subject: {email.subject}
+
+Respond ONLY in valid JSON:
+{{
+  "category": "Important | Personal | Ads",
+  "importance": "High | Low"
+}}
+"""
+
+    response = client.chat.completions.create(
+        model=DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You classify emails for inbox highlighting."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0,
+        max_tokens=80
+    )
+
+    return {
+        "result": response.choices[0].message.content
+    }
+
+
+'''
+@app.post("/save-draft")
+def save_draft(data: DraftInput):
+    service = get_gmail_service()
+
+    message = MIMEText(data.body)
+    message["subject"] = f"Re: {data.subject}"
+
+    raw_message = base64.urlsafe_b64encode(
+        message.as_bytes()
+    ).decode("utf-8")
+
+    draft = {
+        "message": {
+            "raw": raw_message
+        }
+    }
+
+    service.users().drafts().create(
+        userId="me",
+        body=draft
+    ).execute()
+
+    return {"status": "draft saved"} 
+'''
+
+# ---------- Run directly ----------
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000)
+
+
+'''
+import base64
+from email.mime.text import MIMEText
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from google.auth.transport.requests import Request
+import pickle
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+def get_gmail_service():
+    creds = None
+    if os.path.exists("token.pickle"):
+        with open("token.pickle", "rb") as token:
+            creds = pickle.load(token)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(
+                "credentials.json", SCOPES
+            )
+            creds = flow.run_local_server(port=0)
+
+        with open("token.pickle", "wb") as token:
+            pickle.dump(creds, token)
+
+    service = build("gmail", "v1", credentials=creds)
+    return service
+'''
