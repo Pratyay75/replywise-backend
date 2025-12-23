@@ -14,9 +14,9 @@ google-api-python-client
 
 # Authentication & Database
 pymongo
-bcrypt
+bcrypt>=4.0.1,<5.0.0
 python-jose[cryptography]
-passlib[bcrypt]
+passlib[bcrypt]>=1.7.4,<2.0.0
 email-validator
 google-auth
 google-auth-oauthlib

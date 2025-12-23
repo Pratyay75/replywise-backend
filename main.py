@@ -69,14 +69,70 @@ SECRET_KEY = os.getenv("SECRET_KEY", "dev-secret-key-change-in-production-use-se
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24 * 60  # 30 days
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# Initialize password context with explicit bcrypt backend
+# This helps avoid version compatibility issues
+# Workaround for bcrypt version detection issues on Azure
+try:
+    # Try to initialize with explicit settings
+    pwd_context = CryptContext(
+        schemes=["bcrypt"],
+        deprecated="auto",
+        bcrypt__rounds=12,
+        bcrypt__ident="2b"  # Use bcrypt 2b format for better compatibility
+    )
+except Exception as e:
+    print(f"Warning: bcrypt initialization with explicit settings failed: {e}")
+    # Fallback: try without explicit bcrypt config
+    try:
+        pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    except Exception as e2:
+        print(f"Error: Could not initialize bcrypt: {e2}")
+        raise
+
 security = HTTPBearer()
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    """
+    Verify a plain password against a hashed password.
+    Handles bcrypt version compatibility issues gracefully.
+    """
+    try:
+        # Truncate password if it's longer than 72 bytes (bcrypt limit)
+        if isinstance(plain_password, str):
+            plain_password_bytes = plain_password.encode('utf-8')
+            if len(plain_password_bytes) > 72:
+                plain_password = plain_password_bytes[:72].decode('utf-8', errors='ignore')
+        
+        return pwd_context.verify(plain_password, hashed_password)
+    except (ValueError, AttributeError, TypeError) as e:
+        # Log the error for debugging but don't expose details
+        print(f"Password verification error: {type(e).__name__}: {str(e)}")
+        return False
+    except Exception as e:
+        # Catch any other unexpected errors
+        print(f"Unexpected error in password verification: {type(e).__name__}: {str(e)}")
+        return False
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    """
+    Hash a password using bcrypt.
+    Handles password length limits and version compatibility.
+    """
+    try:
+        # Truncate password if it's longer than 72 bytes (bcrypt limit)
+        if isinstance(password, str):
+            password_bytes = password.encode('utf-8')
+            if len(password_bytes) > 72:
+                password = password_bytes[:72].decode('utf-8', errors='ignore')
+        
+        return pwd_context.hash(password)
+    except (ValueError, AttributeError, TypeError) as e:
+        # Log the error for debugging
+        print(f"Password hashing error: {type(e).__name__}: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Error hashing password"
+        )
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
