@@ -257,86 +257,92 @@ async def signup(request: SignupRequest):
 
 @app.post("/auth/login", response_model=TokenResponse)
 async def login(request: LoginRequest):
-    # Check if this is the admin account
-    is_admin = request.email.lower() == ADMIN_ID
-    
-    # Find user
-    user = users_collection.find_one({"email": request.email})
-    
-    # If admin account doesn't exist, create it with password from env
-    if is_admin and not user:
-        hashed_password = get_password_hash(ADMIN_PWD)
-        user = {
-            "email": request.email,
-            "hashed_password": hashed_password,
-            "plan": "admin",
-            "replies_used_this_month": 0,
-            "regenerations_used_this_month": 0,
-            "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat(),
-            "learn_writing_style": False,
-            "writing_samples": [],
-            "created_at": datetime.utcnow(),
-            "updated_at": datetime.utcnow()
-        }
-        users_collection.insert_one(user)
-    elif not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password"
-        )
-    
-    # Verify password (for admin, check against stored password or env password)
-    if is_admin:
-        # For admin, verify against stored password or env password
-        if not verify_password(request.password, user["hashed_password"]):
-            # If password doesn't match stored, check against env password
-            if request.password != ADMIN_PWD:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Incorrect email or password"
-                )
-            # If env password matches, update stored password
-            else:
+    try:
+        # Check if this is the admin account
+        is_admin = request.email.lower() == ADMIN_ID
+        
+        # Find user (optimized - single query)
+        user = users_collection.find_one({"email": request.email})
+        
+        # If admin account doesn't exist, create it with password from env
+        if is_admin and not user:
+            hashed_password = get_password_hash(ADMIN_PWD)
+            user = {
+                "email": request.email,
+                "hashed_password": hashed_password,
+                "plan": "admin",
+                "replies_used_this_month": 0,
+                "regenerations_used_this_month": 0,
+                "monthly_reset_date": (datetime.utcnow() + timedelta(days=30)).isoformat(),
+                "learn_writing_style": False,
+                "writing_samples": [],
+                "created_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow()
+            }
+            users_collection.insert_one(user)
+        elif not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password"
+            )
+        
+        # Verify password (for admin, check against stored password or env password)
+        password_valid = False
+        if is_admin:
+            # For admin, verify against stored password or env password
+            if verify_password(request.password, user["hashed_password"]):
+                password_valid = True
+            elif request.password == ADMIN_PWD:
+                # If env password matches, update stored password
+                password_valid = True
                 hashed_password = get_password_hash(ADMIN_PWD)
                 users_collection.update_one(
                     {"email": request.email},
                     {"$set": {"hashed_password": hashed_password}}
                 )
-    else:
-        # For regular users, verify stored password
-        if not verify_password(request.password, user["hashed_password"]):
+        else:
+            # For regular users, verify stored password
+            password_valid = verify_password(request.password, user["hashed_password"])
+        
+        if not password_valid:
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Incorrect email or password"
             )
-    
-    # Update admin status if logging in as admin
-    if is_admin:
+        
+        # Create access token (do this before DB updates for faster response)
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": request.email}, expires_delta=access_token_expires
+        )
+        
+        # Update user info in single operation (optimized - combine updates)
+        update_data = {"updated_at": datetime.utcnow()}
+        if is_admin:
+            update_data["plan"] = "admin"
+        
         users_collection.update_one(
             {"email": request.email},
-            {"$set": {
-                "plan": "admin",
-                "updated_at": datetime.utcnow()
-            }}
+            {"$set": update_data}
         )
-    
-    # Create access token
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": request.email}, expires_delta=access_token_expires
-    )
-    
-    # Update last login
-    users_collection.update_one(
-        {"email": request.email},
-        {"$set": {"updated_at": datetime.utcnow()}}
-    )
-    
-    return {
-        "access_token": access_token,
-        "token_type": "bearer",
-        "email": request.email
-    }
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "email": request.email
+        }
+    except HTTPException:
+        # Re-raise HTTP exceptions (like 401)
+        raise
+    except Exception as e:
+        # Log unexpected errors
+        print(f"Login error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred during login. Please try again."
+        )
 
 # Add explicit OPTIONS handler for CORS preflight requests
 @app.options("/{full_path:path}")
