@@ -26,9 +26,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Allow all origins (including Chrome extensions)
     allow_credentials=False,  # Must be False when using allow_origins=["*"]
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
     expose_headers=["*"],
+    max_age=3600,
 )
 
 # ---------- Azure OpenAI Client ----------
@@ -338,7 +339,17 @@ async def login(request: LoginRequest):
 # Add explicit OPTIONS handler for CORS preflight requests
 @app.options("/{full_path:path}")
 async def options_handler(full_path: str):
-    return {"message": "OK"}
+    from fastapi import Response
+    return Response(
+        content="",
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "3600",
+        }
+    )
 
 @app.get("/auth/verify")
 async def verify_token(current_user: dict = Depends(get_current_user)):
