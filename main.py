@@ -766,30 +766,28 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
     try:
         # Try with response_format first (if supported), otherwise fallback
         try:
-            # Try with response_format first (if supported), otherwise fallback
-            try:
-                response = client.chat.completions.create(
-                    model=DEPLOYMENT_NAME,
-                    messages=[
-                        {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,  # Lower temperature for more consistent classification
-                    max_tokens=50,  # Reduced tokens for faster response
-                    response_format={"type": "json_object"}  # Force JSON response if supported
-                )
-            except Exception as format_error:
-                # Fallback if response_format is not supported
-                print(f"response_format not supported, using fallback: {format_error}")
-                response = client.chat.completions.create(
-                    model=DEPLOYMENT_NAME,
-                    messages=[
-                        {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only, no markdown, no code blocks, just the JSON object."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    temperature=0.1,
-                    max_tokens=50  # Reduced tokens for faster response
-                )
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,  # Lower temperature for more consistent classification
+                max_tokens=50,  # Reduced tokens for faster response
+                response_format={"type": "json_object"}  # Force JSON response if supported
+            )
+        except Exception as format_error:
+            # Fallback if response_format is not supported
+            print(f"response_format not supported, using fallback: {format_error}")
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
+                    {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only, no markdown, no code blocks, just the JSON object."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=50  # Reduced tokens for faster response
+            )
 
         result_text = response.choices[0].message.content.strip()
         
@@ -803,7 +801,6 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
         result_text = result_text.strip()
         
         # Parse to validate JSON
-        import json
         parsed = json.loads(result_text)
         
         # Validate category
