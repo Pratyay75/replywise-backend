@@ -771,12 +771,12 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
         except Exception as format_error:
             # Fallback if response_format is not supported
             print(f"response_format not supported, using fallback: {format_error}")
-    response = client.chat.completions.create(
-        model=DEPLOYMENT_NAME,
-        messages=[
+            response = client.chat.completions.create(
+                model=DEPLOYMENT_NAME,
+                messages=[
                     {"role": "system", "content": "You are an expert email classifier. Analyze sender and subject to determine if an email is Important (work/action needed), Personal (friends/family), or Ads (promotional/marketing). Always respond with valid JSON only, no markdown, no code blocks, just the JSON object."},
-            {"role": "user", "content": prompt}
-        ],
+                    {"role": "user", "content": prompt}
+                ],
                 temperature=0.1,
                 max_tokens=100
             )
@@ -820,14 +820,19 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
             })
         }
     except Exception as e:
-        # Fallback on error
+        # Log the error for debugging
+        import traceback
+        error_details = traceback.format_exc()
         print(f"Classification error: {e}")
-    return {
+        print(f"Traceback: {error_details}")
+        # Return error response instead of silently falling back
+        return {
             "result": json.dumps({
                 "category": "Ads",
-                "importance": "Low"
+                "importance": "Low",
+                "error": str(e)
             })
-    }
+        }
 
 
 '''
