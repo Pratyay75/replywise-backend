@@ -726,42 +726,47 @@ class DraftInput(BaseModel):
 
 @app.post("/inbox-classify-lite")
 def inbox_classify_lite(email: InboxLiteInput):
-    prompt = f"""Classify this email into one of three categories: Important, Personal, or Ads.
+    # Enhanced prompt with clearer decision rules and examples
+    prompt = f"""You are an expert email classifier. Classify this email into EXACTLY one category: "Important", "Personal", or "Ads".
 
-RULES:
-1. **Important**: 
-   - Work emails from colleagues, clients, or business contacts
-   - Emails with action items, deadlines, or requests
-   - Professional communications (even from companies like Google, Microsoft, etc. if they're about account security, important updates)
-   - Emails from real people asking for something or requiring a response
-   - Examples: "Meeting tomorrow", "Please review", "Your account was accessed", "Invoice attached"
+DECISION RULES (apply in order):
 
-2. **Personal**: 
-   - Emails from friends, family, or personal contacts
-   - Casual conversations and personal updates
-   - Social invitations or personal messages
-   - Examples: "Hey, how are you?", "Birthday party", "Catch up soon"
+1. **Important** - Choose this if ANY of these apply:
+   - Subject contains: "security", "alert", "action required", "action needed", "verify", "confirm", "update required", "sign in", "login", "password", "account", "billing", "invoice", "payment", "meeting", "deadline", "review", "urgent", "important"
+   - Sender is a known service (Google, Microsoft, bank, etc.) AND subject suggests account action needed
+   - Subject suggests work-related task, request, or communication
+   - Examples: "Security alert", "Action required: Finish setting up", "Meeting tomorrow at 2pm", "Please review the document", "Your account was accessed", "Invoice #12345"
 
-3. **Ads**: 
-   - Marketing emails, promotions, sales
-   - Newsletters and automated updates
-   - Spam or promotional content
-   - No action required, just informational
-   - Examples: "50% off sale", "Weekly newsletter", "New product launch", "Special offer"
+2. **Personal** - Choose this if:
+   - Subject suggests personal communication from friends/family
+   - Casual, friendly tone in subject
+   - Personal invitations or updates
+   - Examples: "Hey, how are you?", "Birthday party this weekend", "Catch up soon?", "How's it going?"
+
+3. **Ads** - Choose this if:
+   - Subject contains promotional words: "sale", "discount", "offer", "deal", "promo", "newsletter", "update", "news", "launch", "introducing", "special"
+   - Marketing or promotional content
+   - No action required, just informational marketing
+   - Examples: "50% off sale", "Weekly newsletter", "New product launch", "Special offer", "Your Year in Code", "Thank you for an incredible year"
 
 EMAIL TO CLASSIFY:
 From: {email.sender}
 Subject: {email.subject}
 
-Analyze the sender and subject carefully. If the sender is a company but the subject suggests it's an important account-related email (security, billing, important updates), classify as "Important". If it's clearly promotional or marketing, classify as "Ads".
+IMPORTANT: Analyze the SUBJECT LINE carefully. Look for keywords that indicate the email type.
+- Security/account/action keywords → "Important"
+- Personal/friendly keywords → "Personal"  
+- Promotional/marketing keywords → "Ads"
 
-Respond with ONLY valid JSON, no other text:
+Respond with ONLY valid JSON, no markdown, no code blocks, no explanation:
 {{
   "category": "Important",
   "importance": "High"
 }}
 
-Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for importance."""
+Valid categories: "Important", "Personal", "Ads"
+Valid importance: "High", "Low"
+"""
 
     try:
         # Try with response_format first (if supported), otherwise fallback
@@ -800,31 +805,70 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
             result_text = result_text[:-3]
         result_text = result_text.strip()
         
-        # Parse to validate JSON
-        parsed = json.loads(result_text)
+        # Debug logging to see what AI is returning
+        print(f"DEBUG: Raw AI response for '{email.subject[:50]}...': {result_text[:200]}")
         
-        # Validate category
+        # Parse to validate JSON
+        try:
+            parsed = json.loads(result_text)
+        except json.JSONDecodeError as e:
+            print(f"DEBUG: JSON parse error. Raw text: {result_text}")
+            raise
+        
+        # Validate category with more aggressive normalization
         category = parsed.get("category", "Ads")
-        if category not in ["Important", "Personal", "Ads"]:
-            # Try to normalize
+        category_original = category
+        
+        if not category or not isinstance(category, str):
+            category = "Ads"
+        else:
+            category = category.strip()
             category_lower = category.lower()
-            if "important" in category_lower or "work" in category_lower:
+            
+            # More aggressive matching for Important
+            if (category_lower == "important" or 
+                "important" in category_lower or 
+                "work" in category_lower or
+                "urgent" in category_lower or
+                "action" in category_lower or
+                "security" in category_lower or
+                "alert" in category_lower):
                 category = "Important"
-            elif "personal" in category_lower or "friend" in category_lower or "family" in category_lower:
+            # More aggressive matching for Personal
+            elif (category_lower == "personal" or 
+                  "personal" in category_lower or 
+                  "friend" in category_lower or 
+                  "family" in category_lower or
+                  "casual" in category_lower):
                 category = "Personal"
+            # Default to Ads for everything else
             else:
                 category = "Ads"
         
         # Validate importance
         importance = parsed.get("importance", "Low")
-        if importance not in ["High", "Low"]:
+        if not importance or not isinstance(importance, str):
             importance = "Low"
+        else:
+            importance = importance.strip()
+            if importance.lower() != "high":
+                importance = "Low"
+            else:
+                importance = "High"
+        
+        # Debug logging
+        if category_original != category:
+            print(f"DEBUG: Category normalized from '{category_original}' to '{category}' for '{email.subject[:50]}...'")
+        
+        result = {
+            "category": category,
+            "importance": importance
+        }
+        
+        print(f"DEBUG: Final classification for '{email.subject[:50]}...': {result}")
         
         return {
-            "result": json.dumps({
-                "category": category,
-                "importance": importance
-            })
+            "result": json.dumps(result)
         }
     except Exception as e:
         # Log the error for debugging
