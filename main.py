@@ -22,9 +22,11 @@ app = FastAPI()
 # CORS configuration for Chrome extensions and web access
 # Note: allow_origins=["*"] cannot be used with allow_credentials=True
 # For Chrome extensions, we allow all origins but set credentials to False
+# Content scripts run in page context, so requests come from mail.google.com origin
+# Using ["*"] allows all origins including mail.google.com and Chrome extensions
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins (including Chrome extensions)
+    allow_origins=["*"],  # Allow all origins (including mail.google.com and Chrome extensions)
     allow_credentials=False,  # Must be False when using allow_origins=["*"]
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
@@ -345,7 +347,7 @@ async def options_handler(full_path: str):
         status_code=200,
         headers={
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
             "Access-Control-Allow-Headers": "*",
             "Access-Control-Max-Age": "3600",
         }
