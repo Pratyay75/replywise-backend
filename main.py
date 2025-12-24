@@ -765,7 +765,7 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,  # Lower temperature for more consistent classification
-                max_tokens=100,
+                max_tokens=50,  # Reduced tokens for faster response
                 response_format={"type": "json_object"}  # Force JSON response if supported
             )
         except Exception as format_error:
@@ -778,7 +778,7 @@ Use "Important", "Personal", or "Ads" for category. Use "High" or "Low" for impo
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.1,
-                max_tokens=100
+                max_tokens=50  # Reduced tokens for faster response
             )
 
         result_text = response.choices[0].message.content.strip()
